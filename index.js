@@ -87,12 +87,12 @@ async function processNewToken(mintAddress, symbol, name) {
       name:   tokenData.name   || name   || '',
       logoURI: tokenData.logoURI || '',
       addedAt: Date.now(),
-      // 展示用（最新值，可能有抖动，仅供显示）
-      lp:             tokenData.liquidity    ?? 0,
-      fdv:            tokenData.fdv          ?? 0,
-      holders:        tokenData.holder       ?? 0,
-      price:          tokenData.price        ?? 0,
-      priceChange24h: tokenData.priceChange24h ?? 0,
+      // 强制转 Number，Birdeye 偶尔返回字符串
+      lp:             Number(tokenData.liquidity)    || 0,
+      fdv:            Number(tokenData.fdv)          || 0,
+      holders:        Number(tokenData.holder)       || 0,
+      price:          Number(tokenData.price)        || 0,
+      priceChange24h: Number(tokenData.priceChange24h) || 0,
       xMentions:    null,
       xMentions10m: null,
     };
@@ -155,18 +155,18 @@ async function refreshLoop() {
         continue;
       }
 
-      // 获取新值（用 ?? 避免 0 被旧值覆盖）
-      const newLp  = data.liquidity ?? token.lp;
-      const newFdv = data.fdv       ?? token.fdv;
+      // 获取新值，强制转 Number（Birdeye 偶尔返回字符串），?? 避免 null/undefined 回退到旧值
+      const newLp  = Number(data.liquidity ?? token.lp)  || 0;
+      const newFdv = Number(data.fdv       ?? token.fdv) || 0;
 
       // 更新展示用的最新值
       store.update(token.mint, {
         lp:             newLp,
         fdv:            newFdv,
-        holders:        data.holder         ?? token.holders,
-        price:          data.price          ?? token.price,
-        priceChange24h: data.priceChange24h  ?? token.priceChange24h,
-        logoURI:        data.logoURI         || token.logoURI,
+        holders:        Number(data.holder         ?? token.holders)       || 0,
+        price:          Number(data.price          ?? token.price)         || 0,
+        priceChange24h: Number(data.priceChange24h  ?? token.priceChange24h) || 0,
+        logoURI:        data.logoURI || token.logoURI,
       });
 
       // 记录本次 LP/FDV 到历史队列
@@ -249,10 +249,11 @@ function sleep(ms) {
 }
 
 function fmtNum(n) {
-  if (n == null || n === 0) return '0';
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return n.toFixed(0);
+  const v = Number(n); // 防止 Birdeye 偶尔返回字符串类型
+  if (!v || isNaN(v)) return '0';
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return v.toFixed(0);
 }
 
 // ========== 定时刷新（每30秒）==========
