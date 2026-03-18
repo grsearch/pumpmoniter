@@ -3,40 +3,36 @@ const axios = require('axios');
 /**
  * Webhook 发送服务
  *
- * 当代币满足触发条件时，POST 到配置的 webhook URL：
- *   POST {WEBHOOK_URL}
- *   { "network": "solana", "address": "<mint>", "symbol": "<symbol>" }
+ * 触发条件（AND，全部满足才发送）：
+ *   FDV  >= WEBHOOK_MIN_FDV  (默认 100000)
+ *   LP   >= WEBHOOK_MIN_LP   (默认 10000)
+ *   X mentions >= WEBHOOK_MIN_X  (默认 500)
  *
- * 触发条件（AND 关系，全部满足才发送）：
- *   FDV  > WEBHOOK_MIN_FDV        (默认 100000)
- *   LP   > WEBHOOK_MIN_LP         (默认 10000)
- *   X mentions > WEBHOOK_MIN_X   (默认 500)
+ * 容错：LP/FDV 条件必须基于稳定读数（由 index.js 传入）。
+ *       如果没有稳定读数，LP/FDV 条件暂不判断，等稳定后再触发。
+ *       X mentions 无稳定性要求（不受 Birdeye 影响）。
  *
- * 防重复：每个 mint 只触发一次，记录在 firedSet 中。
+ * 防重复：每个 mint 只触发一次。
  */
 
 class WebhookService {
   constructor() {
-    this.url = process.env.WEBHOOK_URL || '';
+    this.url    = process.env.WEBHOOK_URL    || '';
     this.minFdv = Number(process.env.WEBHOOK_MIN_FDV) || 100000;
     this.minLp  = Number(process.env.WEBHOOK_MIN_LP)  || 10000;
     this.minX   = Number(process.env.WEBHOOK_MIN_X)   || 500;
 
-    // 已触发过的 mint，防止重复发送
-    this.firedSet = new Set();
-
-    // 可注入广播函数，触发后通知前端
+    this.firedSet    = new Set();
     this.broadcastFn = null;
 
     if (!this.url) {
       console.warn('[Webhook] WEBHOOK_URL not set — webhook disabled');
     } else {
       console.log(`[Webhook] Enabled → ${this.url}`);
-      console.log(`[Webhook] Conditions: FDV>${this.minFdv} LP>${this.minLp} X>${this.minX}`);
+      console.log(`[Webhook] Thresholds: FDV>=${this.minFdv} LP>=${this.minLp} X>=${this.minX}`);
     }
   }
 
-  /** 注入 broadcast 函数（由 index.js 调用） */
   setBroadcast(fn) {
     this.broadcastFn = fn;
   }
@@ -46,68 +42,67 @@ class WebhookService {
   }
 
   /**
-   * 检查代币是否满足条件，满足则发送 webhook
-   * 每次数据更新后调用（包括 X mentions 更新后）
-   *
-   * @param {object} token  - store 里的代币对象
+   * @param {object} token        - store 里的 token 对象（含最新展示值）
+   * @param {object|null} stable  - 稳定读数 { lp, fdv, ts }，null 表示数据未稳定
    */
-  async check(token) {
+  async check(token, stable) {
     if (!this.enabled) return;
-    if (this.firedSet.has(token.mint)) return; // 已发送过
+    if (this.firedSet.has(token.mint)) return;
 
-    // X mentions 取 initial 和 10m 中较大的那个
-    const xCount = Math.max(
-      token.xMentions    ?? 0,
-      token.xMentions10m ?? 0
-    );
+    // X mentions：null = 还没查到，不参与判断
+    if (token.xMentions === null && token.xMentions10m === null) return;
+    const xCount = Math.max(token.xMentions ?? 0, token.xMentions10m ?? 0);
+    if (xCount < this.minX) return;
 
-    const meetsFdv = token.fdv  >= this.minFdv;
-    const meetsLp  = token.lp   >= this.minLp;
-    const meetsX   = xCount     >= this.minX;
+    // LP/FDV：必须有稳定读数才判断（容错核心）
+    if (!stable) {
+      // 数据还太新（< 5分钟），暂不触发，等下一轮刷新
+      console.log(`[Webhook] $${token.symbol} X=${xCount} ✓ but LP/FDV not stable yet, skip`);
+      return;
+    }
 
-    if (!meetsFdv || !meetsLp || !meetsX) return; // 条件未全部满足
+    if (stable.fdv < this.minFdv) return;
+    if (stable.lp  < this.minLp)  return;
 
-    // 标记已发送（先标记，防止并发重复触发）
+    // 所有条件满足，触发
     this.firedSet.add(token.mint);
-
-    await this._send(token, xCount);
+    await this._send(token, stable, xCount);
   }
 
-  async _send(token, xCount) {
+  async _send(token, stable, xCount) {
     const payload = {
       network: 'solana',
       address: token.mint,
       symbol:  token.symbol,
     };
 
-    console.log(`[Webhook] 🚀 Firing for $${token.symbol} | FDV=$${fmtNum(token.fdv)} LP=$${fmtNum(token.lp)} X=${xCount}`);
-    console.log(`[Webhook] POST ${this.url}`, JSON.stringify(payload));
+    console.log(
+      `[Webhook] 🚀 Firing $${token.symbol}` +
+      ` | stableFDV=$${fmtNum(stable.fdv)} stableLP=$${fmtNum(stable.lp)} X=${xCount}`
+    );
 
     try {
       const res = await axios.post(this.url, payload, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 10000,
       });
-      console.log(`[Webhook] ✅ Sent $${token.symbol} → HTTP ${res.status}`);
+      console.log(`[Webhook] ✅ $${token.symbol} → HTTP ${res.status}`);
 
-      // Notify frontend
       if (this.broadcastFn) {
         this.broadcastFn('webhook_fired', { mint: token.mint, symbol: token.symbol });
       }
     } catch (err) {
-      // 发送失败：从已发送集合里移除，允许下次重试
+      // 发送失败，移除标记允许下次重试
       this.firedSet.delete(token.mint);
-
       const status = err.response?.status;
       if (status) {
-        console.error(`[Webhook] ❌ Failed $${token.symbol} → HTTP ${status}:`, err.response?.data ?? '');
+        console.error(`[Webhook] ❌ $${token.symbol} → HTTP ${status}:`, err.response?.data ?? '');
       } else {
-        console.error(`[Webhook] ❌ Failed $${token.symbol}:`, err.message);
+        console.error(`[Webhook] ❌ $${token.symbol}:`, err.message);
       }
     }
   }
 
-  /** 已触发列表（供 API 查询） */
   getFired() {
     return Array.from(this.firedSet);
   }
