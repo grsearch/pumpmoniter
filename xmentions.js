@@ -18,9 +18,9 @@ class XMentionsService {
   }
 
   /**
-   * 获取 symbol/合约 在过去24小时的 X 提及数
-   * @param {string} symbol     代币符号，如 "BONK"
-   * @param {string} mintAddress 合约地址
+   * 获取合约地址在过去24小时的 X 提及数
+   * @param {string} symbol      代币符号（仅用于日志）
+   * @param {string} mintAddress 合约地址（唯一搜索关键字）
    * @returns {number|null}
    */
   async getMentions(symbol, mintAddress) {
@@ -28,10 +28,13 @@ class XMentionsService {
       console.warn('[X] No bearer token configured, skipping');
       return null;
     }
+    if (!mintAddress) {
+      console.warn(`[X] No mint address for ${symbol}, skipping`);
+      return null;
+    }
 
     try {
-      const query = this._buildQuery(symbol, mintAddress);
-      if (!query) return null;
+      const query = this._buildQuery(mintAddress);
 
       const now = new Date();
       const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
@@ -43,7 +46,6 @@ class XMentionsService {
         end_time: now.toISOString(),
       };
 
-      // 获取代理配置（失败时为 null，退化为直连）
       const proxyCfg = await this.proxy.getAxiosConfig();
 
       const reqConfig = {
@@ -52,7 +54,7 @@ class XMentionsService {
         },
         params,
         timeout: 20000,
-        ...(proxyCfg || {}),  // 展开代理配置（httpsAgent + proxy:false）
+        ...(proxyCfg || {}),
       };
 
       const res = await axios.get(
@@ -61,6 +63,7 @@ class XMentionsService {
       );
 
       const total = res.data?.meta?.total_tweet_count ?? 0;
+      console.log(`[X] $${symbol} (${mintAddress.slice(0,8)}...) mentions: ${total}`);
       return total;
 
     } catch (err) {
@@ -69,26 +72,13 @@ class XMentionsService {
     }
   }
 
-  _buildQuery(symbol, mintAddress) {
-    let query = '';
-
-    if (symbol && symbol !== '???' && symbol.length > 1) {
-      // 搜索 $SYMBOL 或 #SYMBOL
-      query = `($${symbol} OR #${symbol})`;
-      // 同时搜索合约地址前缀（增加命中率）
-      if (mintAddress) {
-        const shortMint = mintAddress.slice(0, 8);
-        query += ` OR "${shortMint}"`;
-      }
-    } else if (mintAddress) {
-      query = `"${mintAddress}"`;
-    } else {
-      return null;
-    }
-
-    // 排除转推，减少噪音
-    query += ' -is:retweet';
-    return query;
+  /**
+   * 以合约地址为唯一关键字构建搜索 query
+   * 完整地址用引号包裹，确保精确匹配，排除转推
+   */
+  _buildQuery(mintAddress) {
+    // 用完整合约地址做精确匹配，加引号防止被拆分
+    return `"${mintAddress}" -is:retweet`;
   }
 
   _handleError(err, symbol) {
