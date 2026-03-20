@@ -175,33 +175,16 @@ async function refreshLoop() {
       const updated = store.get(token.mint);
       if (!updated) { await sleep(300); continue; }
 
-      // ---- 退出判断：必须基于稳定读数 ----
+      // ---- 退出判断 ----
       const stable = store.getStableReading(token.mint);
 
-      if (stable) {
-        // 有稳定读数，用稳定值来判断是否退出
-        if (shouldExit(updated, stable)) {
-          const reason = getExitReason(updated, stable);
-          console.log(`[EXIT] $${updated.symbol} — ${reason} (stable: LP=$${fmtNum(stable.lp)} FDV=$${fmtNum(stable.fdv)})`);
-          store.remove(token.mint);
-          broadcast('token_removed', { mint: token.mint, reason });
-          await sleep(300);
-          continue;
-        }
-      } else {
-        // 没有稳定读数（刚上线 < 5min），跳过退出判断，但记录日志
-        const age = getAgeHours(updated);
-        if (age > 0.5) {  // 超过30分钟还没稳定读数，打个警告
-          console.log(`[WARN] $${updated.symbol} no stable reading yet (age=${age.toFixed(1)}h)`);
-        }
-        // 但 LP < 2000 这种极端情况，即使没有稳定读数也直接退出（防止垃圾币占位）
-        if (newLp > 0 && newLp < 500) {
-          console.log(`[EXIT] $${updated.symbol} — LP critically low ($${fmtNum(newLp)}), no stable check needed`);
-          store.remove(token.mint);
-          broadcast('token_removed', { mint: token.mint, reason: `LP critically low ($${fmtNum(newLp)})` });
-          await sleep(300);
-          continue;
-        }
+      if (shouldExit(updated, stable)) {
+        const reason = getExitReason(updated, stable);
+        console.log(`[EXIT] $${updated.symbol} — ${reason}`);
+        store.remove(token.mint);
+        broadcast('token_removed', { mint: token.mint, reason });
+        await sleep(300);
+        continue;
       }
 
       broadcast('token_updated', updated);
@@ -218,28 +201,24 @@ async function refreshLoop() {
   }
 }
 
-// ========== 退出条件（基于稳定读数）==========
+// ========== 退出条件 ==========
 function getAgeHours(token) {
   return (Date.now() - token.addedAt) / 3600000;
 }
 
 function shouldExit(token, stable) {
   const ageH = getAgeHours(token);
-  // age 用 token 本身的时间戳（不受 API 数据影响）
-  if (ageH > 48) return true;
-  // LP/FDV 用稳定值
-  if (ageH > 1 && stable.fdv < 50000) return true;
-  if (ageH > 1 && stable.lp  < 10000) return true;
-  if (stable.lp < 2000) return true;
+  // Age > 1H：无条件退出，不依赖 stable
+  if (ageH > 1) return true;
+  // Age > 15min 且 FDV < 20000：需要 stable 且 FDV 有效值（> 0 防止获取失败误删）
+  if (ageH > 0.25 && stable && stable.fdv > 0 && stable.fdv < 20000) return true;
   return false;
 }
 
 function getExitReason(token, stable) {
   const ageH = getAgeHours(token);
-  if (ageH > 48)                       return 'Age > 48H';
-  if (ageH > 1 && stable.fdv < 50000) return `FDV $${fmtNum(stable.fdv)} < $50K (age>1H)`;
-  if (ageH > 1 && stable.lp  < 10000) return `LP $${fmtNum(stable.lp)} < $10K (age>1H)`;
-  if (stable.lp < 2000)                return `LP $${fmtNum(stable.lp)} < $2K`;
+  if (ageH > 1) return 'Age > 1H';
+  if (ageH > 0.25 && stable && stable.fdv < 20000) return `FDV $${fmtNum(stable.fdv)} < $20K (age>15min)`;
   return 'Unknown';
 }
 
