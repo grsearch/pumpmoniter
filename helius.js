@@ -10,6 +10,8 @@ const axios = require('axios');
  *
  * 兜底：REST 轮询（getSignaturesForAddress，每20秒）
  *   WebSocket 断线期间补漏，确保不丢事件
+ *   注意：轮询只查 BC program，不查 AMM program
+ *         AMM 上有大量老币交易，轮询会误收录历史币
  *
  * pump.fun 相关 Program：
  *   bonding curve:  6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
@@ -103,7 +105,7 @@ class HeliusMonitor {
   }
 
   _subscribe() {
-    // logsSubscribe：同时监听 BC 和新 AMM program
+    // 主订阅：BC program（MigrateFunds 在这里触发）
     const req = {
       jsonrpc: '2.0',
       id: 1,
@@ -115,7 +117,8 @@ class HeliusMonitor {
     };
     this.ws.send(JSON.stringify(req));
 
-    // 同时订阅新 AMM program
+    // 辅助订阅：新 AMM program（捕获 CreatePool/InitializePool）
+    // WS 订阅没问题，_isMigrationLogs 会过滤掉普通 buy/sell
     const req2 = {
       jsonrpc: '2.0',
       id: 2,
@@ -174,7 +177,7 @@ class HeliusMonitor {
     this._stopPing();
     this.pingTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.ping(); // 标准 WebSocket ping frame
+        this.ws.ping();
       }
     }, PING_INTERVAL_MS);
   }
@@ -201,6 +204,7 @@ class HeliusMonitor {
 
   async _pollInit() {
     // 建立已有签名的基准线，启动后不处理历史交易
+    // 两个 program 都要记录基准线，避免重启后重复处理
     const [sigs1, sigs2] = await Promise.all([
       this._fetchSigs(PUMP_BC_PROGRAM),
       this._fetchSigs(PUMP_AMM_PROGRAM),
@@ -211,10 +215,11 @@ class HeliusMonitor {
 
   async _pollOnce() {
     try {
-      await Promise.all([
-        this._processNewSigs(PUMP_BC_PROGRAM),
-        this._processNewSigs(PUMP_AMM_PROGRAM),
-      ]);
+      // ⚠️ 轮询只查 BC program
+      // AMM program 上每秒都有大量老币的 buy/sell 交易
+      // 即使 _isMigrationLogs 过滤，轮询延迟窗口内仍可能漏网
+      // WS 订阅已覆盖 AMM 的实时事件，轮询无需重复
+      await this._processNewSigs(PUMP_BC_PROGRAM);
     } catch (err) {
       console.error('[Helius] Poll error:', err.message);
     }
@@ -285,15 +290,19 @@ class HeliusMonitor {
 
   /**
    * 判断是否为迁移交易
-   * 支持旧 BC（MigrateFunds）和新 AMM（CreatePool / InitializePool / Buy）格式
+   * 只匹配明确的迁移指令关键词：
+   *   MigrateFunds  — 旧 BC → Raydium 路径
+   *   CreatePool    — 新 BC → pump AMM 路径
+   *   InitializePool — 部分新格式
+   *
+   * ⚠️ 不匹配 program 地址本身：AMM 上所有 buy/sell 日志都包含 program 地址，
+   *    匹配地址会把老币的每一笔交易都误判为迁移事件。
    */
   _isMigrationLogs(logs) {
     return logs.some(log =>
-      log.includes('MigrateFunds')    ||
-      log.includes('CreatePool')      ||
-      log.includes('InitializePool')  ||
-      // 新 pump AMM 格式：program 日志本身就是迁移标志
-      log.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')
+      log.includes('MigrateFunds')   ||
+      log.includes('CreatePool')     ||
+      log.includes('InitializePool')
     );
   }
 
@@ -301,11 +310,10 @@ class HeliusMonitor {
    * 从交易中提取 mint 地址
    *
    * 修复：旧逻辑只找以 "pump" 结尾的地址，新 AMM 迁移后 mint 不再有此后缀。
-   * 新逻辑：
-   *   1. postTokenBalances — 优先，不限后缀，取第一个有效 mint
-   *   2. preTokenBalances  — 同上
+   * 新逻辑优先级：
+   *   1. postTokenBalances — 最可靠，直接包含 mint 字段
+   *   2. preTokenBalances  — 备选
    *   3. accountKeys       — 排除已知 program 地址后取第一个
-   *   兜底保留旧的 "pump" 后缀匹配，避免极端情况漏报
    */
   _extractMint(tx) {
     const post = tx.meta?.postTokenBalances || [];
