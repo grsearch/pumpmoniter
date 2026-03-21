@@ -4,9 +4,13 @@ const axios = require('axios');
  * Webhook 发送服务
  *
  * 触发条件：
- *   X mentions >= WEBHOOK_MIN_X (默认 10)
+ *   X mentions（第一次检测值）>= WEBHOOK_MIN_X (默认 10)
  *
- * LP/FDV 条件已移除，只要 X mentions 满足即发送。
+ * X mentions 会被检测两次：
+ *   第一次：代币收录后立即查询（xMentions）
+ *   第二次：10分钟后再查一次（xMentions10m）
+ * Webhook 只基于第一次的值判断，第二次检测后不再触发。
+ *
  * 防重复：每个 mint 只触发一次。
  */
 
@@ -22,7 +26,7 @@ class WebhookService {
       console.warn('[Webhook] WEBHOOK_URL not set — webhook disabled');
     } else {
       console.log(`[Webhook] Enabled → ${this.url}`);
-      console.log(`[Webhook] Threshold: X >= ${this.minX}`);
+      console.log(`[Webhook] Threshold: X >= ${this.minX} (first check only)`);
     }
   }
 
@@ -42,15 +46,18 @@ class WebhookService {
     if (!this.enabled) return;
     if (this.firedSet.has(token.mint)) return;
 
-    // X mentions 还没查到，等待
-    if (token.xMentions === null && token.xMentions10m === null) return;
+    // xMentions10m 已有值，说明是第二次检测调用，跳过
+    if (token.xMentions10m !== null && token.xMentions10m !== undefined) return;
 
-    const xCount = Math.max(token.xMentions ?? 0, token.xMentions10m ?? 0);
-    if (xCount < this.minX) return;
+    // 第一次检测还没完成，等待
+    if (token.xMentions === null || token.xMentions === undefined) return;
+
+    // 用第一次的值判断
+    if (token.xMentions < this.minX) return;
 
     // 条件满足，触发
     this.firedSet.add(token.mint);
-    await this._send(token, xCount);
+    await this._send(token, token.xMentions);
   }
 
   async _send(token, xCount) {
