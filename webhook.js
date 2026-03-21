@@ -4,14 +4,14 @@ const axios = require('axios');
  * Webhook 发送服务
  *
  * 触发条件：
- *   X mentions（第一次检测值）>= WEBHOOK_MIN_X (默认 10)
+ *   X mentions >= WEBHOOK_MIN_X (默认 10)
  *
  * X mentions 会被检测两次：
  *   第一次：代币收录后立即查询（xMentions）
- *   第二次：10分钟后再查一次（xMentions10m）
- * Webhook 只基于第一次的值判断，第二次检测后不再触发。
+ *   第二次：5分钟后再查一次（xMentions10m）
  *
- * 防重复：每个 mint 只触发一次。
+ * 两次检测均可独立触发 webhook，条件均为 >= WEBHOOK_MIN_X。
+ * 防重复：每个 mint 只触发一次，第一次已触发的不会在第二次重复发送。
  */
 
 class WebhookService {
@@ -26,7 +26,7 @@ class WebhookService {
       console.warn('[Webhook] WEBHOOK_URL not set — webhook disabled');
     } else {
       console.log(`[Webhook] Enabled → ${this.url}`);
-      console.log(`[Webhook] Threshold: X >= ${this.minX} (first check only)`);
+      console.log(`[Webhook] Threshold: X >= ${this.minX} (both checks)`);
     }
   }
 
@@ -40,41 +40,47 @@ class WebhookService {
 
   /**
    * @param {object} token        - store 里的 token 对象
-   * @param {object|null} stable  - 稳定读数（不再使用，保留参数兼容调用方）
+   * @param {object|null} stable  - 稳定读数（保留参数兼容调用方）
+   * @param {string} [stage]      - 'initial' | '10m' | undefined（refreshLoop 调用时不传）
    */
-  async check(token, stable) {
+  async check(token, stable, stage) {
     if (!this.enabled) return;
     if (this.firedSet.has(token.mint)) return;
 
-    // xMentions10m 已有值，说明是第二次检测调用，跳过
-    if (token.xMentions10m !== null && token.xMentions10m !== undefined) return;
+    // refreshLoop 调用时不传 stage，跳过（webhook 只由 X 检测回调触发）
+    if (!stage) return;
 
-    // 第一次检测还没完成，等待
-    if (token.xMentions === null || token.xMentions === undefined) return;
+    if (stage === 'initial') {
+      // 第一次检测：xMentions 有值才判断
+      if (token.xMentions === null || token.xMentions === undefined) return;
+      if (token.xMentions < this.minX) return;
+      this.firedSet.add(token.mint);
+      await this._send(token, token.xMentions, 'initial');
 
-    // 用第一次的值判断
-    if (token.xMentions < this.minX) return;
-
-    // 条件满足，触发
-    this.firedSet.add(token.mint);
-    await this._send(token, token.xMentions);
+    } else if (stage === '10m') {
+      // 第二次检测：xMentions10m 有值才判断，且第一次未触发
+      if (token.xMentions10m === null || token.xMentions10m === undefined) return;
+      if (token.xMentions10m < this.minX) return;
+      this.firedSet.add(token.mint);
+      await this._send(token, token.xMentions10m, '5min-check');
+    }
   }
 
-  async _send(token, xCount) {
+  async _send(token, xCount, checkLabel) {
     const payload = {
       network: 'solana',
       address: token.mint,
       symbol:  token.symbol,
     };
 
-    console.log(`[Webhook] 🚀 Firing $${token.symbol} | X=${xCount}`);
+    console.log(`[Webhook] 🚀 Firing $${token.symbol} | X=${xCount} (${checkLabel})`);
 
     try {
       const res = await axios.post(this.url, payload, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 10000,
       });
-      console.log(`[Webhook] ✅ $${token.symbol} → HTTP ${res.status}`);
+      console.log(`[Webhook] ✅ $${token.symbol} → HTTP ${res.status} (${checkLabel})`);
 
       if (this.broadcastFn) {
         this.broadcastFn('webhook_fired', { mint: token.mint, symbol: token.symbol });
