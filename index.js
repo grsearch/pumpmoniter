@@ -108,12 +108,12 @@ async function processNewToken(mintAddress, symbol, name) {
     // 3. 立即查 X mentions
     fetchXMentions(mintAddress, entry.symbol, 'initial');
 
-    // 4. 10分钟后再查一次
+    // 4. 5分钟后再查一次
     setTimeout(() => {
       if (store.get(mintAddress)) {
         fetchXMentions(mintAddress, entry.symbol, '10m');
       }
-    }, 10 * 60 * 1000);
+    }, 5 * 60 * 1000);
 
   } catch (err) {
     console.error(`[ERROR] processNewToken ${mintAddress}:`, err.message);
@@ -136,7 +136,7 @@ async function fetchXMentions(mintAddress, symbol, stage) {
     console.log(`[X] $${symbol} mentions (${stage}): ${count}`);
 
     // X mentions 更新后检查 webhook（稳定性由 webhook.check 内部判断）
-    await webhook.check(updated, store.getStableReading(mintAddress));
+    await webhook.check(updated, store.getStableReading(mintAddress), stage);
   } catch (err) {
     console.error(`[ERROR] fetchXMentions $${symbol}:`, err.message);
   }
