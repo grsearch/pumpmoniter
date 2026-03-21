@@ -26,6 +26,19 @@ const POLL_INTERVAL_MS = 20 * 1000;
 const SIGNATURES_LIMIT = 25;
 const PING_INTERVAL_MS = 30 * 1000;
 
+// 已知 Program 地址，提取 mint 时排除
+const KNOWN_PROGRAMS = new Set([
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  '11111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bRS',
+  'SysvarRent111111111111111111111111111111111',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',  // Metaplex metadata
+  'So11111111111111111111111111111111111111112',    // Wrapped SOL
+]);
+
 class HeliusMonitor {
   constructor(apiKey) {
     this.apiKey    = apiKey;
@@ -90,8 +103,7 @@ class HeliusMonitor {
   }
 
   _subscribe() {
-    // logsSubscribe：监听 pump.fun bonding curve program 的所有日志
-    // mentions 过滤：只推送包含该 program 地址的交易
+    // logsSubscribe：同时监听 BC 和新 AMM program
     const req = {
       jsonrpc: '2.0',
       id: 1,
@@ -102,18 +114,30 @@ class HeliusMonitor {
       ],
     };
     this.ws.send(JSON.stringify(req));
-    console.log('[Helius] logsSubscribe sent for pump.fun BC program');
+
+    // 同时订阅新 AMM program
+    const req2 = {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'logsSubscribe',
+      params: [
+        { mentions: [PUMP_AMM_PROGRAM] },
+        { commitment: 'confirmed' },
+      ],
+    };
+    this.ws.send(JSON.stringify(req2));
+
+    console.log('[Helius] logsSubscribe sent for BC + AMM programs');
   }
 
   _handleMessage(msg) {
     // 订阅确认
-    if (msg.id === 1) {
+    if (msg.id === 1 || msg.id === 2) {
       if (msg.error) {
         console.error('[Helius] logsSubscribe error:', JSON.stringify(msg.error));
         return;
       }
-      this.subId = msg.result;
-      console.log(`[Helius] logsSubscribe confirmed (subId=${this.subId}) ✓`);
+      console.log(`[Helius] logsSubscribe confirmed (id=${msg.id} subId=${msg.result}) ✓`);
       return;
     }
 
@@ -242,45 +266,70 @@ class HeliusMonitor {
 
     const mint = this._extractMint(tx);
     if (!mint) {
-      console.log(`[Helius] Migration tx but mint not found: ${signature.slice(0,8)}...`);
+      // 调试：打印 postTokenBalances，帮助排查新格式
+      const post = tx.meta?.postTokenBalances || [];
+      console.log(`[Helius] _extractMint failed sig=${signature.slice(0,8)} postBalanceMints=${JSON.stringify(post.map(b => b.mint))}`);
       return;
     }
 
     if (this.seenMints.has(mint)) return;
     this.seenMints.add(mint);
 
-    console.log(`[Helius] ✅ Migration: ${'mint'} = ${mint}`);
+    console.log(`[Helius] ✅ Migration: mint = ${mint}`);
     this._emit(mint, signature);
   }
 
   // ============================================================
   // 工具方法
   // ============================================================
+
+  /**
+   * 判断是否为迁移交易
+   * 支持旧 BC（MigrateFunds）和新 AMM（CreatePool / InitializePool / Buy）格式
+   */
   _isMigrationLogs(logs) {
     return logs.some(log =>
-      log.includes('MigrateFunds') ||
-      log.includes('CreatePool')   ||
-      log.includes('InitializePool')
+      log.includes('MigrateFunds')    ||
+      log.includes('CreatePool')      ||
+      log.includes('InitializePool')  ||
+      // 新 pump AMM 格式：program 日志本身就是迁移标志
+      log.includes('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA')
     );
   }
 
+  /**
+   * 从交易中提取 mint 地址
+   *
+   * 修复：旧逻辑只找以 "pump" 结尾的地址，新 AMM 迁移后 mint 不再有此后缀。
+   * 新逻辑：
+   *   1. postTokenBalances — 优先，不限后缀，取第一个有效 mint
+   *   2. preTokenBalances  — 同上
+   *   3. accountKeys       — 排除已知 program 地址后取第一个
+   *   兜底保留旧的 "pump" 后缀匹配，避免极端情况漏报
+   */
   _extractMint(tx) {
-    // 1. postTokenBalances 里找以 pump 结尾的 mint
     const post = tx.meta?.postTokenBalances || [];
-    for (const b of post) {
-      if (b.mint?.endsWith('pump')) return b.mint;
-    }
-    // 2. preTokenBalances
-    const pre = tx.meta?.preTokenBalances || [];
-    for (const b of pre) {
-      if (b.mint?.endsWith('pump')) return b.mint;
-    }
-    // 3. accountKeys
+    const pre  = tx.meta?.preTokenBalances  || [];
     const keys = tx.transaction?.message?.accountKeys || [];
+
+    // 1. postTokenBalances — 优先（最可靠）
+    for (const b of post) {
+      if (b.mint && b.mint.length >= 32) return b.mint;
+    }
+
+    // 2. preTokenBalances
+    for (const b of pre) {
+      if (b.mint && b.mint.length >= 32) return b.mint;
+    }
+
+    // 3. accountKeys — 排除已知 program 地址
     for (const acc of keys) {
       const k = acc.pubkey || acc;
-      if (typeof k === 'string' && k.endsWith('pump') && k.length > 30) return k;
+      if (typeof k === 'string' && k.length >= 32 && !KNOWN_PROGRAMS.has(k)) {
+        return k;
+      }
     }
+
     return null;
   }
 
