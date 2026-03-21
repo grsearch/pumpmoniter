@@ -177,6 +177,7 @@ class HeliusMonitor {
 
   async _pollInit() {
     // 建立已有签名的基准线，启动后不处理历史交易
+    // 两个 program 都要记录，防止重启后重复处理
     const [sigs1, sigs2] = await Promise.all([
       this._fetchSigs(PUMP_BC_PROGRAM),
       this._fetchSigs(PUMP_AMM_PROGRAM),
@@ -187,10 +188,11 @@ class HeliusMonitor {
 
   async _pollOnce() {
     try {
-      await Promise.all([
-        this._processNewSigs(PUMP_BC_PROGRAM),
-        this._processNewSigs(PUMP_AMM_PROGRAM),
-      ]);
+      // 只轮询 BC program
+      // AMM program 上有大量老币 buy/sell 交易，日志里可能包含
+      // CreatePool/InitializePool 关键词，轮询会误收录历史老币
+      // AMM 的实时迁移事件已由 WS logsSubscribe 覆盖
+      await this._processNewSigs(PUMP_BC_PROGRAM);
     } catch (err) {
       console.error('[Helius] Poll error:', err.message);
     }
