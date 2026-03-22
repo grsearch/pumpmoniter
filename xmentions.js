@@ -6,6 +6,9 @@ const { WebshareProxyManager } = require('./proxy');
  * Uses GET /2/tweets/counts/recent — cheapest endpoint (~$0.005/req)
  *
  * 支持通过 Webshare 代理访问，解决腾讯云 IP 被 X 封锁问题。
+ *
+ * 注意：end_time 必须比请求时间早至少10秒，否则 X API 返回 400 错误。
+ *       这里提前30秒作为安全缓冲。
  */
 
 class XMentionsService {
@@ -36,14 +39,17 @@ class XMentionsService {
     try {
       const query = this._buildQuery(mintAddress);
 
+      // end_time 提前30秒，避免 X API 400 错误
+      // （X 要求 end_time 必须比请求时间早至少10秒）
       const now = new Date();
-      const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      const end = new Date(now.getTime() - 30 * 1000);
+      const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
 
       const params = {
         query,
         granularity: 'hour',
         start_time: start.toISOString(),
-        end_time: now.toISOString(),
+        end_time:   end.toISOString(),
       };
 
       const proxyCfg = await this.proxy.getAxiosConfig();
@@ -77,7 +83,6 @@ class XMentionsService {
    * 完整地址用引号包裹，确保精确匹配，排除转推
    */
   _buildQuery(mintAddress) {
-    // 用完整合约地址做精确匹配，加引号防止被拆分
     return `"${mintAddress}" -is:retweet`;
   }
 
@@ -89,6 +94,8 @@ class XMentionsService {
       console.error('[X] 403 Forbidden — 你的 X 计划不支持此 endpoint（需要 Basic+）');
     } else if (status === 429) {
       console.warn(`[X] 429 Rate Limited — ${symbol} 稍后重试`);
+    } else if (status === 400) {
+      console.error(`[X] 400 Bad Request — ${symbol}:`, err.response?.data ?? '');
     } else if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
       console.error(`[X] 连接失败 (${err.code}) — 代理可能不可用`);
     } else if (err.code === 'ECONNRESET') {
