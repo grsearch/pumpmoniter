@@ -108,12 +108,12 @@ async function processNewToken(mintAddress, symbol, name) {
     // 3. 立即查 X mentions
     fetchXMentions(mintAddress, entry.symbol, 'initial');
 
-    // 4. 5分钟后再查一次
+    // 4. 2分钟后再查一次
     setTimeout(() => {
       if (store.get(mintAddress)) {
         fetchXMentions(mintAddress, entry.symbol, '10m');
       }
-    }, 5 * 60 * 1000);
+    }, 2 * 60 * 1000);
 
   } catch (err) {
     console.error(`[ERROR] processNewToken ${mintAddress}:`, err.message);
@@ -135,8 +135,8 @@ async function fetchXMentions(mintAddress, symbol, stage) {
     broadcast('token_updated', updated);
     console.log(`[X] $${symbol} mentions (${stage}): ${count}`);
 
-    // X mentions 更新后检查 webhook（稳定性由 webhook.check 内部判断）
-    await webhook.check(updated, store.getStableReading(mintAddress), stage);
+    // X mentions 更新后检查 webhook
+    await webhook.check(updated, store.getStableReading(mintAddress));
   } catch (err) {
     console.error(`[ERROR] fetchXMentions $${symbol}:`, err.message);
   }
@@ -155,7 +155,7 @@ async function refreshLoop() {
         continue;
       }
 
-      // 获取新值，强制转 Number（Birdeye 偶尔返回字符串），?? 避免 null/undefined 回退到旧值
+      // 获取新值，强制转 Number，?? 避免 null/undefined 回退到旧值
       const newLp  = Number(data.liquidity ?? token.lp)  || 0;
       const newFdv = Number(data.fdv       ?? token.fdv) || 0;
 
@@ -189,7 +189,7 @@ async function refreshLoop() {
 
       broadcast('token_updated', updated);
 
-      // webhook 检查也要传入稳定读数
+      // webhook 检查
       webhook.check(updated, stable).catch(() => {});
 
       await sleep(300);
@@ -208,9 +208,7 @@ function getAgeHours(token) {
 
 function shouldExit(token, stable) {
   const ageH = getAgeHours(token);
-  // Age > 1H：无条件退出，不依赖 stable
   if (ageH > 1) return true;
-  // Age > 15min 且 FDV < 20000：需要 stable 且 FDV 有效值（> 0 防止获取失败误删）
   if (ageH > 0.25 && stable && stable.fdv > 0 && stable.fdv < 20000) return true;
   return false;
 }
@@ -228,7 +226,7 @@ function sleep(ms) {
 }
 
 function fmtNum(n) {
-  const v = Number(n); // 防止 Birdeye 偶尔返回字符串类型
+  const v = Number(n);
   if (!v || isNaN(v)) return '0';
   if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
   if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
