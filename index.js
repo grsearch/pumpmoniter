@@ -15,7 +15,7 @@ const server = http.createServer(app);
 
 const wss = new WebSocket.Server({ server });
 
-app.use(express.static(path.join(__dirname, '../public')));
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
 // ========== Token Store ==========
