@@ -3,6 +3,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
 const path = require('path');
+const axios = require('axios');
 
 const { HeliusMonitor } = require('./helius');
 const { BirdeyeService } = require('./birdeye');
@@ -37,6 +38,31 @@ const xService = new XMentionsService(process.env.X_BEARER_TOKEN);
 const helius   = new HeliusMonitor(process.env.HELIUS_API_KEY);
 const webhook  = new WebhookService();
 webhook.setBroadcast(broadcast);
+
+// ========== Helius RPC: 查询 holder 数量 ==========
+const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
+
+async function getHolderCount(mintAddress) {
+  try {
+    const res = await axios.post(HELIUS_RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTokenAccounts',
+      params: {
+        mint: mintAddress,
+        limit: 1000,
+        page: 1,
+      },
+    }, { timeout: 10000 });
+
+    const accounts = res.data?.result?.token_accounts;
+    if (!Array.isArray(accounts)) return 0;
+    return accounts.length;
+  } catch (err) {
+    console.error(`[Holders] getHolderCount(${mintAddress.slice(0,8)}...) error:`, err.message);
+    return 0;
+  }
+}
 
 // ========== REST API ==========
 app.get('/api/tokens', (req, res) => {
@@ -87,10 +113,9 @@ async function processNewToken(mintAddress, symbol, name) {
       name:   tokenData.name   || name   || '',
       logoURI: tokenData.logoURI || '',
       addedAt: Date.now(),
-      // 强制转 Number，Birdeye 偶尔返回字符串
       lp:             Number(tokenData.liquidity)    || 0,
       fdv:            Number(tokenData.fdv)          || 0,
-      holders:        Number(tokenData.holder)       || 0,
+      holders:        0,   // 先用0，异步查完再更新
       price:          Number(tokenData.price)        || 0,
       priceChange24h: Number(tokenData.priceChange24h) || 0,
       xMentions:    null,
@@ -98,17 +123,22 @@ async function processNewToken(mintAddress, symbol, name) {
     };
 
     store.add(entry);
-
-    // 记录第一条 LP/FDV 历史（用于稳定性判断）
     store.recordLpFdv(mintAddress, entry.lp, entry.fdv);
-
     broadcast('token_added', entry);
     console.log(`[ADD] $${entry.symbol} | LP=$${fmtNum(entry.lp)} FDV=$${fmtNum(entry.fdv)}`);
 
-    // 3. 立即查 X mentions
+    // 3. 异步查 holders（不阻塞主流程）
+    getHolderCount(mintAddress).then(holders => {
+      if (!store.get(mintAddress)) return;
+      store.update(mintAddress, { holders });
+      broadcast('token_updated', store.get(mintAddress));
+      console.log(`[Holders] $${entry.symbol}: ${holders}`);
+    });
+
+    // 4. 立即查 X mentions
     fetchXMentions(mintAddress, entry.symbol, 'initial');
 
-    // 4. 2分钟后再查一次
+    // 5. 2分钟后再查一次
     setTimeout(() => {
       if (store.get(mintAddress)) {
         fetchXMentions(mintAddress, entry.symbol, '10m');
@@ -135,7 +165,6 @@ async function fetchXMentions(mintAddress, symbol, stage) {
     broadcast('token_updated', updated);
     console.log(`[X] $${symbol} mentions (${stage}): ${count}`);
 
-    // X mentions 更新后检查 webhook
     await webhook.check(updated, store.getStableReading(mintAddress));
   } catch (err) {
     console.error(`[ERROR] fetchXMentions $${symbol}:`, err.message);
@@ -155,27 +184,27 @@ async function refreshLoop() {
         continue;
       }
 
-      // 获取新值，强制转 Number，?? 避免 null/undefined 回退到旧值
       const newLp  = Number(data.liquidity ?? token.lp)  || 0;
       const newFdv = Number(data.fdv       ?? token.fdv) || 0;
 
-      // 更新展示用的最新值
+      // Birdeye 的 holder 字段对新币是 null，用旧值保留
+      const birdeyeHolders = Number(data.holder) || 0;
+
       store.update(token.mint, {
         lp:             newLp,
         fdv:            newFdv,
-        holders:        Number(data.holder         ?? token.holders)       || 0,
+        // 只有 Birdeye 返回有效值时才覆盖，否则保留已有的 Helius 数据
+        holders:        birdeyeHolders || token.holders,
         price:          Number(data.price          ?? token.price)         || 0,
         priceChange24h: Number(data.priceChange24h  ?? token.priceChange24h) || 0,
         logoURI:        data.logoURI || token.logoURI,
       });
 
-      // 记录本次 LP/FDV 到历史队列
       store.recordLpFdv(token.mint, newLp, newFdv);
 
       const updated = store.get(token.mint);
       if (!updated) { await sleep(300); continue; }
 
-      // ---- 退出判断 ----
       const stable = store.getStableReading(token.mint);
 
       if (shouldExit(updated, stable)) {
@@ -188,8 +217,6 @@ async function refreshLoop() {
       }
 
       broadcast('token_updated', updated);
-
-      // webhook 检查
       webhook.check(updated, stable).catch(() => {});
 
       await sleep(300);
@@ -198,6 +225,22 @@ async function refreshLoop() {
       console.error(`[ERROR] refreshLoop $${token.symbol}:`, err.message);
       await sleep(300);
     }
+  }
+}
+
+// ========== holders 单独刷新（每60秒，与 Birdeye 刷新错开）==========
+async function holdersRefreshLoop() {
+  const tokens = store.getAll();
+  for (const token of tokens) {
+    const holders = await getHolderCount(token.mint);
+    if (!store.get(token.mint)) continue;
+    // 只在有变化时更新，减少不必要的 broadcast
+    if (holders !== token.holders) {
+      store.update(token.mint, { holders });
+      broadcast('token_updated', store.get(token.mint));
+      console.log(`[Holders] $${token.symbol}: ${token.holders} → ${holders}`);
+    }
+    await sleep(500); // 每个 token 间隔 500ms，避免 RPC 限速
   }
 }
 
@@ -233,8 +276,9 @@ function fmtNum(n) {
   return v.toFixed(0);
 }
 
-// ========== 定时刷新（每30秒）==========
-setInterval(refreshLoop, 30 * 1000);
+// ========== 定时任务 ==========
+setInterval(refreshLoop, 30 * 1000);          // Birdeye 数据每30秒刷新
+setInterval(holdersRefreshLoop, 60 * 1000);   // Holders 每60秒刷新
 
 // ========== Helius 事件监听 ==========
 helius.onMigration(async (event) => {
@@ -242,7 +286,6 @@ helius.onMigration(async (event) => {
 });
 
 helius.connect();
-
 xService.testProxyConnection().catch(() => {});
 
 // ========== WebSocket 客户端连接 ==========
