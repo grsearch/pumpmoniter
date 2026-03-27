@@ -31,32 +31,25 @@ class WebhookService {
     return !!this.url;
   }
 
-  /**
-   * @param {object} token        - store 里的 token 对象
-   * @param {object|null} stable  - 稳定读数（保留参数兼容调用方）
-   */
   async check(token, stable) {
     if (!this.enabled) return;
-
-    // 已发送过，不重复
     if (this.firedSet.has(token.mint)) return;
-
-    // 条件：FDV >= 25000
     if ((token.fdv || 0) < this.minFdv) return;
 
-    // 条件满足，触发
     this.firedSet.add(token.mint);
     await this._send(token);
   }
 
   async _send(token) {
     const payload = {
-      network: 'solana',
-      address: token.mint,
-      symbol:  token.symbol,
+      network:   'solana',
+      address:   token.mint,
+      symbol:    token.symbol,
+      xMentions: token.xMentions ?? null,
+      holders:   token.holders   ?? 0,
     };
 
-    console.log(`[Webhook] 🚀 Firing $${token.symbol} | FDV=$${token.fdv}`);
+    console.log(`[Webhook] 🚀 Firing $${token.symbol} | FDV=$${token.fdv} | X=${payload.xMentions} | Holders=${payload.holders}`);
 
     try {
       const res = await axios.post(this.url, payload, {
@@ -69,7 +62,6 @@ class WebhookService {
         this.broadcastFn('webhook_fired', { mint: token.mint, symbol: token.symbol });
       }
     } catch (err) {
-      // 发送失败，移除标记允许下次重试
       this.firedSet.delete(token.mint);
       const status = err.response?.status;
       if (status) {
