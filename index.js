@@ -13,61 +13,82 @@ const { WebhookService } = require('./webhook');
 
 const app = express();
 const server = http.createServer(app);
-
 const wss = new WebSocket.Server({ server });
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// ========== Token Store ==========
 const store = new TokenStore();
 
-// ========== Broadcast（先定义，再传给 webhook）==========
 function broadcast(type, data) {
   const msg = JSON.stringify({ type, data, ts: Date.now() });
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(msg);
-    }
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
   });
 }
 
-// ========== Services ==========
 const birdeye = new BirdeyeService(process.env.BIRDEYE_API_KEY);
 const xService = new XMentionsService(process.env.X_BEARER_TOKEN);
 const helius   = new HeliusMonitor(process.env.HELIUS_API_KEY);
 const webhook  = new WebhookService();
 webhook.setBroadcast(broadcast);
 
-// ========== Helius RPC: 查询 holder 数量 ==========
 const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
 
-async function getHolderCount(mintAddress) {
+// ========== Helius RPC: 查询所有 token accounts ==========
+// 返回 { holders, top10Pct, devPct }
+// devAddress 可为 null，此时 devPct = null
+async function fetchHolderStats(mintAddress, devAddress) {
   try {
-    const res = await axios.post(HELIUS_RPC_URL, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getTokenAccounts',
-      params: {
-        mint: mintAddress,
-        limit: 1000,
-        page: 1,
-      },
-    }, { timeout: 10000 });
+    // 拉取所有 token accounts（含余额）
+    let allAccounts = [];
+    let page = 1;
+    while (true) {
+      const res = await axios.post(HELIUS_RPC_URL, {
+        jsonrpc: '2.0', id: 1,
+        method: 'getTokenAccounts',
+        params: { mint: mintAddress, limit: 1000, page },
+      }, { timeout: 15000 });
 
-    const accounts = res.data?.result?.token_accounts;
-    if (!Array.isArray(accounts)) return 0;
-    return accounts.length;
+      const accounts = res.data?.result?.token_accounts;
+      if (!Array.isArray(accounts) || accounts.length === 0) break;
+      allAccounts = allAccounts.concat(accounts);
+      if (accounts.length < 1000) break; // 最后一页
+      page++;
+    }
+
+    if (allAccounts.length === 0) return { holders: 0, top10Pct: null, devPct: null };
+
+    // 总供应量 = 所有账户余额之和
+    const totalSupply = allAccounts.reduce((sum, a) => sum + Number(a.amount || 0), 0);
+    if (totalSupply === 0) return { holders: allAccounts.length, top10Pct: null, devPct: null };
+
+    // 按余额降序排列
+    allAccounts.sort((a, b) => Number(b.amount) - Number(a.amount));
+
+    // Top 10 占比
+    const top10Sum = allAccounts.slice(0, 10).reduce((sum, a) => sum + Number(a.amount || 0), 0);
+    const top10Pct = (top10Sum / totalSupply) * 100;
+
+    // DEV 持仓占比
+    let devPct = null;
+    if (devAddress) {
+      const devAccount = allAccounts.find(a => a.owner === devAddress);
+      const devAmount = devAccount ? Number(devAccount.amount || 0) : 0;
+      devPct = (devAmount / totalSupply) * 100;
+    }
+
+    console.log(`[Stats] ${mintAddress.slice(0,8)}... holders=${allAccounts.length} top10=${top10Pct.toFixed(1)}% dev=${devPct !== null ? devPct.toFixed(1)+'%' : 'N/A'}`);
+    return { holders: allAccounts.length, top10Pct, devPct };
+
   } catch (err) {
-    console.error(`[Holders] getHolderCount(${mintAddress.slice(0,8)}...) error:`, err.message);
-    return 0;
+    console.error(`[Stats] fetchHolderStats(${mintAddress.slice(0,8)}...) error:`, err.message);
+    return { holders: 0, top10Pct: null, devPct: null };
   }
 }
 
 // ========== REST API ==========
-app.get('/api/tokens', (req, res) => {
-  res.json(store.getAll());
-});
+app.get('/api/tokens', (req, res) => res.json(store.getAll()));
 
 app.get('/api/stats', (req, res) => {
   res.json({
@@ -84,42 +105,37 @@ app.get('/api/webhook/fired', (req, res) => {
 });
 
 // ========== Process new migration event ==========
-async function processNewToken(mintAddress, symbol, name) {
+async function processNewToken(mintAddress, symbol, name, devAddress) {
   if (store.get(mintAddress)) {
     console.log(`[SKIP] ${mintAddress} already tracked`);
     return;
   }
 
-  console.log(`[NEW] Migration detected: ${mintAddress}`);
+  console.log(`[NEW] Migration detected: ${mintAddress} dev=${devAddress || 'unknown'}`);
 
   try {
-    // 1. 权限检查
     const authOk = await birdeye.checkAuthorities(mintAddress);
-    if (!authOk) {
-      console.log(`[SKIP] ${mintAddress} failed authority check`);
-      return;
-    }
+    if (!authOk) { console.log(`[SKIP] ${mintAddress} failed authority check`); return; }
 
-    // 2. 获取代币数据
     const tokenData = await birdeye.getTokenData(mintAddress);
-    if (!tokenData) {
-      console.log(`[SKIP] ${mintAddress} no token data`);
-      return;
-    }
+    if (!tokenData) { console.log(`[SKIP] ${mintAddress} no token data`); return; }
 
     const entry = {
-      mint: mintAddress,
-      symbol: tokenData.symbol || symbol || '???',
-      name:   tokenData.name   || name   || '',
+      mint:    mintAddress,
+      symbol:  tokenData.symbol || symbol || '???',
+      name:    tokenData.name   || name   || '',
       logoURI: tokenData.logoURI || '',
       addedAt: Date.now(),
-      lp:             Number(tokenData.liquidity)    || 0,
-      fdv:            Number(tokenData.fdv)          || 0,
-      holders:        0,   // 先用0，异步查完再更新
-      price:          Number(tokenData.price)        || 0,
+      lp:             Number(tokenData.liquidity)      || 0,
+      fdv:            Number(tokenData.fdv)            || 0,
+      holders:        0,
+      top10Pct:       null,   // Top 10 持仓占比 (%)
+      devPct:         null,   // DEV 持仓占比 (%)
+      devAddress:     devAddress || null,
+      price:          Number(tokenData.price)          || 0,
       priceChange24h: Number(tokenData.priceChange24h) || 0,
-      xMentions:    null,
-      xMentions10m: null,
+      xMentions:      null,
+      xMentions10m:   null,
     };
 
     store.add(entry);
@@ -127,22 +143,17 @@ async function processNewToken(mintAddress, symbol, name) {
     broadcast('token_added', entry);
     console.log(`[ADD] $${entry.symbol} | LP=$${fmtNum(entry.lp)} FDV=$${fmtNum(entry.fdv)}`);
 
-    // 3. 异步查 holders（不阻塞主流程）
-    getHolderCount(mintAddress).then(holders => {
+    // 异步查 holder stats（holders + top10 + dev）
+    fetchHolderStats(mintAddress, devAddress).then(stats => {
       if (!store.get(mintAddress)) return;
-      store.update(mintAddress, { holders });
+      store.update(mintAddress, stats);
       broadcast('token_updated', store.get(mintAddress));
-      console.log(`[Holders] $${entry.symbol}: ${holders}`);
     });
 
-    // 4. 立即查 X mentions
     fetchXMentions(mintAddress, entry.symbol, 'initial');
 
-    // 5. 2分钟后再查一次
     setTimeout(() => {
-      if (store.get(mintAddress)) {
-        fetchXMentions(mintAddress, entry.symbol, '10m');
-      }
+      if (store.get(mintAddress)) fetchXMentions(mintAddress, entry.symbol, '10m');
     }, 2 * 60 * 1000);
 
   } catch (err) {
@@ -156,22 +167,18 @@ async function fetchXMentions(mintAddress, symbol, stage) {
     const token = store.get(mintAddress);
     if (!token) return;
 
-    store.update(mintAddress, stage === 'initial'
-      ? { xMentions: count }
-      : { xMentions10m: count }
-    );
+    store.update(mintAddress, stage === 'initial' ? { xMentions: count } : { xMentions10m: count });
 
     const updated = store.get(mintAddress);
     broadcast('token_updated', updated);
     console.log(`[X] $${symbol} mentions (${stage}): ${count}`);
-
     await webhook.check(updated, store.getStableReading(mintAddress));
   } catch (err) {
     console.error(`[ERROR] fetchXMentions $${symbol}:`, err.message);
   }
 }
 
-// ========== Real-time data refresh loop ==========
+// ========== Real-time data refresh loop (Birdeye, 每30秒) ==========
 async function refreshLoop() {
   const tokens = store.getAll();
   if (tokens.length === 0) return;
@@ -179,23 +186,17 @@ async function refreshLoop() {
   for (const token of tokens) {
     try {
       const data = await birdeye.getTokenData(token.mint);
-      if (!data) {
-        await sleep(300);
-        continue;
-      }
+      if (!data) { await sleep(300); continue; }
 
       const newLp  = Number(data.liquidity ?? token.lp)  || 0;
       const newFdv = Number(data.fdv       ?? token.fdv) || 0;
-
-      // Birdeye 的 holder 字段对新币是 null，用旧值保留
       const birdeyeHolders = Number(data.holder) || 0;
 
       store.update(token.mint, {
         lp:             newLp,
         fdv:            newFdv,
-        // 只有 Birdeye 返回有效值时才覆盖，否则保留已有的 Helius 数据
         holders:        birdeyeHolders || token.holders,
-        price:          Number(data.price          ?? token.price)         || 0,
+        price:          Number(data.price          ?? token.price)          || 0,
         priceChange24h: Number(data.priceChange24h  ?? token.priceChange24h) || 0,
         logoURI:        data.logoURI || token.logoURI,
       });
@@ -218,7 +219,6 @@ async function refreshLoop() {
 
       broadcast('token_updated', updated);
       webhook.check(updated, stable).catch(() => {});
-
       await sleep(300);
 
     } catch (err) {
@@ -228,26 +228,28 @@ async function refreshLoop() {
   }
 }
 
-// ========== holders 单独刷新（每60秒，与 Birdeye 刷新错开）==========
-async function holdersRefreshLoop() {
+// ========== Holder stats 刷新（每90秒）==========
+async function holderStatsRefreshLoop() {
   const tokens = store.getAll();
   for (const token of tokens) {
-    const holders = await getHolderCount(token.mint);
+    const stats = await fetchHolderStats(token.mint, token.devAddress || null);
     if (!store.get(token.mint)) continue;
-    // 只在有变化时更新，减少不必要的 broadcast
-    if (holders !== token.holders) {
-      store.update(token.mint, { holders });
+
+    const changed =
+      stats.holders  !== token.holders  ||
+      stats.top10Pct !== token.top10Pct ||
+      stats.devPct   !== token.devPct;
+
+    if (changed) {
+      store.update(token.mint, stats);
       broadcast('token_updated', store.get(token.mint));
-      console.log(`[Holders] $${token.symbol}: ${token.holders} → ${holders}`);
     }
-    await sleep(500); // 每个 token 间隔 500ms，避免 RPC 限速
+    await sleep(1000); // 每个 token 间隔 1s，避免 RPC 限速
   }
 }
 
 // ========== 退出条件 ==========
-function getAgeHours(token) {
-  return (Date.now() - token.addedAt) / 3600000;
-}
+function getAgeHours(token) { return (Date.now() - token.addedAt) / 3600000; }
 
 function shouldExit(token, stable) {
   const ageH = getAgeHours(token);
@@ -263,10 +265,7 @@ function getExitReason(token, stable) {
   return 'Unknown';
 }
 
-// ========== 工具函数 ==========
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function fmtNum(n) {
   const v = Number(n);
@@ -277,18 +276,17 @@ function fmtNum(n) {
 }
 
 // ========== 定时任务 ==========
-setInterval(refreshLoop, 30 * 1000);          // Birdeye 数据每30秒刷新
-setInterval(holdersRefreshLoop, 60 * 1000);   // Holders 每60秒刷新
+setInterval(refreshLoop, 30 * 1000);
+setInterval(holderStatsRefreshLoop, 90 * 1000);
 
-// ========== Helius 事件监听 ==========
+// ========== Helius 事件监听（现在带 devAddress）==========
 helius.onMigration(async (event) => {
-  await processNewToken(event.mint, event.symbol, event.name);
+  await processNewToken(event.mint, event.symbol, event.name, event.devAddress || null);
 });
 
 helius.connect();
 xService.testProxyConnection().catch(() => {});
 
-// ========== WebSocket 客户端连接 ==========
 wss.on('connection', (ws) => {
   console.log('[WS] Client connected');
   ws.send(JSON.stringify({ type: 'init', data: store.getAll(), ts: Date.now() }));
@@ -296,7 +294,6 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => console.error('[WS] Client error:', err.message));
 });
 
-// ========== 启动 ==========
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`\n🚀 Pump Monitor running at http://localhost:${PORT}`);
