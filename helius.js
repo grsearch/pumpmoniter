@@ -62,19 +62,29 @@ class HeliusMonitor {
   }
 
   _subscribe() {
+    // 同时订阅 pump.fun BC 程序 和 PumpSwap AMM 程序，确保两条迁移路径都能被 WS 捕获
     this.ws.send(JSON.stringify({
       jsonrpc: '2.0', id: 1,
       method: 'logsSubscribe',
       params: [{ mentions: [PUMP_BC_PROGRAM] }, { commitment: 'confirmed' }],
     }));
-    console.log('[Helius] logsSubscribe sent for pump.fun BC program');
+    this.ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 2,
+      method: 'logsSubscribe',
+      params: [{ mentions: [PUMP_AMM_PROGRAM] }, { commitment: 'confirmed' }],
+    }));
+    console.log('[Helius] logsSubscribe sent for pump.fun BC + PumpSwap AMM programs');
   }
 
   _handleMessage(msg) {
-    if (msg.id === 1) {
+    if (msg.id === 1 || msg.id === 2) {
       if (msg.error) { console.error('[Helius] logsSubscribe error:', JSON.stringify(msg.error)); return; }
-      this.subId = msg.result;
-      console.log(`[Helius] logsSubscribe confirmed (subId=${this.subId}) ✓`);
+      if (msg.id === 1) {
+        this.subId = msg.result;
+        console.log(`[Helius] logsSubscribe (BC) confirmed (subId=${this.subId}) ✓`);
+      } else {
+        console.log(`[Helius] logsSubscribe (AMM) confirmed (subId=${msg.result}) ✓`);
+      }
       return;
     }
     if (msg.result === 'pong') return;
@@ -123,8 +133,15 @@ class HeliusMonitor {
   }
 
   async _pollOnce() {
-    try { await this._processNewSigs(PUMP_BC_PROGRAM); }
-    catch (err) { console.error('[Helius] Poll error:', err.message); }
+    try {
+      // 新路径：同时轮询 PumpSwap AMM 程序（原来只轮询 BC）
+      await Promise.all([
+        this._processNewSigs(PUMP_BC_PROGRAM),
+        this._processNewSigs(PUMP_AMM_PROGRAM),
+      ]);
+    } catch (err) {
+      console.error('[Helius] Poll error:', err.message);
+    }
   }
 
   async _fetchSigs(program) {
@@ -177,19 +194,50 @@ class HeliusMonitor {
     if (this.seenMints.has(mint)) return;
     this.seenMints.add(mint);
 
-    // 提取 DEV 地址：迁移交易的 fee payer（第一个 accountKey）
     const devAddress = this._extractDevAddress(tx);
 
-    console.log(`[Helius] ✅ Migration: mint=${mint} dev=${devAddress || 'unknown'}`);
+    // 判断走的是哪条迁移路径（便于日志排查）
+    const path = this._isPumpSwapMigration(logs) ? 'PumpSwap' : 'Raydium';
+    console.log(`[Helius] ✅ Migration [${path}]: mint=${mint} dev=${devAddress || 'unknown'}`);
     this._emit(mint, signature, devAddress);
   }
 
+  // ─── 迁移日志检测（双路径）───────────────────────────────────────
+  //
+  //  老路径（pre-2025）：pump.fun 毕业 → Raydium
+  //    日志包含 MigrateFunds / CreatePool / InitializePool
+  //
+  //  新路径（2025年3月 PumpSwap 上线后，覆盖 95%+ 新币）：
+  //    pump.fun BC 程序触发 migrate 指令
+  //    + 同笔 tx 内 PumpSwap AMM 程序触发 create_pool
+  //
   _isMigrationLogs(logs) {
-    return logs.some(log =>
+    // 老路径：Raydium（极少数，保留兜底）
+    const hasOldStyle = logs.some(log =>
       log.includes('MigrateFunds') ||
       log.includes('CreatePool')   ||
       log.includes('InitializePool')
     );
+    if (hasOldStyle) return true;
+
+    // 新路径：PumpSwap
+    return this._isPumpSwapMigration(logs);
+  }
+
+  // PumpSwap 迁移判断：必须同时满足 migrate + PumpSwap AMM create_pool
+  // 两个条件都满足才触发，避免单独的 create_pool（其他协议）产生误报
+  _isPumpSwapMigration(logs) {
+    const hasMigrate = logs.some(log =>
+      log.includes('Instruction: Migrate') ||
+      log.includes('migrate')               // Program log: migrate / invoke 等均可命中
+    );
+    if (!hasMigrate) return false;
+
+    const hasPumpSwapPool = logs.some(log =>
+      log.includes(PUMP_AMM_PROGRAM) ||
+      log.includes('create_pool')
+    );
+    return hasPumpSwapPool;
   }
 
   _extractMint(tx) {
@@ -205,7 +253,6 @@ class HeliusMonitor {
     return null;
   }
 
-  // Fee payer = 第一个 accountKey，且 signer: true, writable: true
   _extractDevAddress(tx) {
     try {
       const keys = tx.transaction?.message?.accountKeys || [];
