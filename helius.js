@@ -1,21 +1,6 @@
 const WebSocket = require('ws');
 const axios = require('axios');
 
-/**
- * Helius Monitor — pump.fun 迁移事件监听
- *
- * 主轨：标准 Solana WebSocket（wss://mainnet.helius-rpc.com）
- *   使用标准 logsSubscribe，监听 pump.fun bonding curve program
- *   过滤包含 MigrateFunds 的交易日志，再 getTransaction 解析 mint
- *
- * 兜底：REST 轮询（getSignaturesForAddress，每20秒）
- *   WebSocket 断线期间补漏，确保不丢事件
- *
- * pump.fun 相关 Program：
- *   bonding curve:  6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
- *   pump AMM (新):  pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
- */
-
 const PUMP_BC_PROGRAM  = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const PUMP_AMM_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 
@@ -41,13 +26,8 @@ class HeliusMonitor {
     this.seenMints = new Set();
   }
 
-  isConnected() {
-    return this.wsAlive;
-  }
-
-  onMigration(cb) {
-    this.callbacks.push(cb);
-  }
+  isConnected() { return this.wsAlive; }
+  onMigration(cb) { this.callbacks.push(cb); }
 
   connect() {
     console.log('[Helius] Starting pump.fun migration monitor...');
@@ -55,9 +35,6 @@ class HeliusMonitor {
     this._startPolling();
   }
 
-  // ============================================================
-  // 标准 Solana WebSocket（主轨）
-  // ============================================================
   _connectWS() {
     console.log('[Helius] Connecting Standard WebSocket...');
     this.ws = new WebSocket(this.wsUrl);
@@ -70,10 +47,7 @@ class HeliusMonitor {
     });
 
     this.ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        this._handleMessage(msg);
-      } catch (e) { /* ignore */ }
+      try { this._handleMessage(JSON.parse(data.toString())); } catch (e) {}
     });
 
     this.ws.on('close', (code) => {
@@ -84,87 +58,51 @@ class HeliusMonitor {
       setTimeout(() => this._connectWS(), 5000);
     });
 
-    this.ws.on('error', (err) => {
-      console.error('[Helius] WS error:', err.message);
-    });
+    this.ws.on('error', (err) => console.error('[Helius] WS error:', err.message));
   }
 
   _subscribe() {
-    // logsSubscribe：监听 pump.fun bonding curve program 的所有日志
-    // mentions 过滤：只推送包含该 program 地址的交易
-    const req = {
-      jsonrpc: '2.0',
-      id: 1,
+    this.ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 1,
       method: 'logsSubscribe',
-      params: [
-        { mentions: [PUMP_BC_PROGRAM] },
-        { commitment: 'confirmed' },
-      ],
-    };
-    this.ws.send(JSON.stringify(req));
+      params: [{ mentions: [PUMP_BC_PROGRAM] }, { commitment: 'confirmed' }],
+    }));
     console.log('[Helius] logsSubscribe sent for pump.fun BC program');
   }
 
   _handleMessage(msg) {
-    // 订阅确认
     if (msg.id === 1) {
-      if (msg.error) {
-        console.error('[Helius] logsSubscribe error:', JSON.stringify(msg.error));
-        return;
-      }
+      if (msg.error) { console.error('[Helius] logsSubscribe error:', JSON.stringify(msg.error)); return; }
       this.subId = msg.result;
       console.log(`[Helius] logsSubscribe confirmed (subId=${this.subId}) ✓`);
       return;
     }
-
-    // pong
     if (msg.result === 'pong') return;
 
-    // 日志通知
     if (msg.method === 'logsNotification') {
       const value = msg.params?.result?.value;
-      if (!value) return;
-
-      // 跳过失败交易
-      if (value.err) return;
-
+      if (!value || value.err) return;
       const logs = value.logs || [];
-      const sig  = value.signature;
-
-      // 只处理包含迁移相关指令的交易
       if (!this._isMigrationLogs(logs)) return;
-
+      const sig = value.signature;
       console.log(`[Helius] WS migration log detected: ${sig?.slice(0,8)}...`);
-
-      // 异步解析完整交易获取 mint
       this._parseTxFromRpc(sig).catch(err =>
         console.error(`[Helius] parseTx error (${sig?.slice(0,8)}):`, err.message)
       );
     }
   }
 
-  // ============================================================
-  // Ping（保持连接，防止10分钟超时断线）
-  // ============================================================
   _startPing() {
     this._stopPing();
     this.pingTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.ping(); // 标准 WebSocket ping frame
-      }
+      if (this.ws?.readyState === WebSocket.OPEN) this.ws.ping();
     }, PING_INTERVAL_MS);
   }
 
   _stopPing() {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
-    }
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
   }
 
-  // ============================================================
-  // REST 轮询兜底
-  // ============================================================
   _startPolling() {
     this._pollInit().then(() => {
       this.pollTimer = setInterval(() => this._pollOnce(), POLL_INTERVAL_MS);
@@ -176,8 +114,6 @@ class HeliusMonitor {
   }
 
   async _pollInit() {
-    // 建立已有签名的基准线，启动后不处理历史交易
-    // 两个 program 都要记录，防止重启后重复处理
     const [sigs1, sigs2] = await Promise.all([
       this._fetchSigs(PUMP_BC_PROGRAM),
       this._fetchSigs(PUMP_AMM_PROGRAM),
@@ -187,15 +123,8 @@ class HeliusMonitor {
   }
 
   async _pollOnce() {
-    try {
-      // 只轮询 BC program
-      // AMM program 上有大量老币 buy/sell 交易，日志里可能包含
-      // CreatePool/InitializePool 关键词，轮询会误收录历史老币
-      // AMM 的实时迁移事件已由 WS logsSubscribe 覆盖
-      await this._processNewSigs(PUMP_BC_PROGRAM);
-    } catch (err) {
-      console.error('[Helius] Poll error:', err.message);
-    }
+    try { await this._processNewSigs(PUMP_BC_PROGRAM); }
+    catch (err) { console.error('[Helius] Poll error:', err.message); }
   }
 
   async _fetchSigs(program) {
@@ -215,16 +144,12 @@ class HeliusMonitor {
       if (info.err) continue;
       this._parseTxFromRpc(info.signature).catch(() => {});
     }
-    // 防止内存泄漏
     if (this.seenSigs.size > 2000) {
       const arr = Array.from(this.seenSigs);
       arr.slice(0, 1000).forEach(s => this.seenSigs.delete(s));
     }
   }
 
-  // ============================================================
-  // 解析交易，提取 mint 地址
-  // ============================================================
   async _parseTxFromRpc(signature) {
     const res = await axios.post(this.rpcUrl, {
       jsonrpc: '2.0', id: 1,
@@ -244,7 +169,6 @@ class HeliusMonitor {
 
     const mint = this._extractMint(tx);
     if (!mint) {
-      // 调试日志：打印 postTokenBalances，帮助排查失败原因
       const post = tx.meta?.postTokenBalances || [];
       console.log(`[Helius] mint extract failed sig=${signature.slice(0,8)} postBalanceMints=${JSON.stringify(post.map(b => b.mint))}`);
       return;
@@ -253,13 +177,13 @@ class HeliusMonitor {
     if (this.seenMints.has(mint)) return;
     this.seenMints.add(mint);
 
-    console.log(`[Helius] ✅ Migration: ${'mint'} = ${mint}`);
-    this._emit(mint, signature);
+    // 提取 DEV 地址：迁移交易的 fee payer（第一个 accountKey）
+    const devAddress = this._extractDevAddress(tx);
+
+    console.log(`[Helius] ✅ Migration: mint=${mint} dev=${devAddress || 'unknown'}`);
+    this._emit(mint, signature, devAddress);
   }
 
-  // ============================================================
-  // 工具方法
-  // ============================================================
   _isMigrationLogs(logs) {
     return logs.some(log =>
       log.includes('MigrateFunds') ||
@@ -269,17 +193,10 @@ class HeliusMonitor {
   }
 
   _extractMint(tx) {
-    // 1. postTokenBalances 里找以 pump 结尾的 mint
     const post = tx.meta?.postTokenBalances || [];
-    for (const b of post) {
-      if (b.mint?.endsWith('pump')) return b.mint;
-    }
-    // 2. preTokenBalances
+    for (const b of post) { if (b.mint?.endsWith('pump')) return b.mint; }
     const pre = tx.meta?.preTokenBalances || [];
-    for (const b of pre) {
-      if (b.mint?.endsWith('pump')) return b.mint;
-    }
-    // 3. accountKeys
+    for (const b of pre)  { if (b.mint?.endsWith('pump')) return b.mint; }
     const keys = tx.transaction?.message?.accountKeys || [];
     for (const acc of keys) {
       const k = acc.pubkey || acc;
@@ -288,8 +205,24 @@ class HeliusMonitor {
     return null;
   }
 
-  _emit(mint, signature) {
-    const event = { mint, signature, symbol: null, name: null };
+  // Fee payer = 第一个 accountKey，且 signer: true, writable: true
+  _extractDevAddress(tx) {
+    try {
+      const keys = tx.transaction?.message?.accountKeys || [];
+      for (const acc of keys) {
+        const pubkey = acc.pubkey || acc;
+        const isSigner   = acc.signer   ?? false;
+        const isWritable = acc.writable ?? false;
+        if (isSigner && isWritable && typeof pubkey === 'string') {
+          return pubkey;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  _emit(mint, signature, devAddress) {
+    const event = { mint, signature, devAddress, symbol: null, name: null };
     for (const cb of this.callbacks) {
       cb(event).catch(e => console.error('[Helius] callback error:', e.message));
     }
