@@ -446,6 +446,126 @@
       color: var(--cyan);
     }
 
+    /* === HOLDERS CELL === */
+    .holders-cell {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .holders-icon {
+      display: flex;
+      align-items: center;
+      gap: 1px;
+      flex-shrink: 0;
+    }
+
+    /* Three stacked person silhouettes using CSS */
+    .holders-icon .person {
+      width: 5px;
+      height: 9px;
+      position: relative;
+    }
+    .holders-icon .person::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 50%;
+      transform: translateX(-50%);
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .holders-icon .person::after {
+      content: '';
+      position: absolute;
+      bottom: 0; left: 50%;
+      transform: translateX(-50%);
+      width: 7px; height: 5px;
+      border-radius: 3px 3px 0 0;
+      background: currentColor;
+    }
+
+    .holders-val {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .holders-bar-wrap {
+      width: 36px;
+      height: 3px;
+      background: rgba(255,255,255,0.07);
+      border-radius: 2px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .holders-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s ease, background 0.6s ease;
+    }
+
+    /* Color tiers */
+    .holders-tier-hot   { color: var(--green); }
+    .holders-tier-hot   .holders-bar-fill { background: var(--green); }
+
+    .holders-tier-mid   { color: var(--amber); }
+    .holders-tier-mid   .holders-bar-fill { background: var(--amber); }
+
+    .holders-tier-low   { color: var(--red); }
+    .holders-tier-low   .holders-bar-fill { background: var(--red); }
+
+    .holders-tier-zero  { color: var(--muted); }
+    .holders-tier-zero  .holders-bar-fill { background: rgba(255,255,255,0.15); }
+
+    /* holders change flash */
+    @keyframes holders-up {
+      0%   { background: rgba(0,255,136,0.18); }
+      100% { background: transparent; }
+    }
+    .holders-updated {
+      animation: holders-up 1s ease-out;
+    }
+
+
+    /* === CONCENTRATION CELLS (Top10 / Dev) === */
+    .pct-cell {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .pct-val { font-weight: 700; }
+
+    .pct-bar-wrap {
+      width: 32px;
+      height: 3px;
+      background: rgba(255,255,255,0.07);
+      border-radius: 2px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .pct-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s ease, background 0.6s ease;
+    }
+
+    /* Top10 tiers: green < 40%, amber 40-70%, red > 70% */
+    .pct-safe   { color: var(--green); }
+    .pct-safe   .pct-bar-fill { background: var(--green); }
+    .pct-mid    { color: var(--amber); }
+    .pct-mid    .pct-bar-fill { background: var(--amber); }
+    .pct-danger { color: var(--red); }
+    .pct-danger .pct-bar-fill { background: var(--red); }
+    .pct-none   { color: var(--muted); }
+    .pct-none   .pct-bar-fill { background: rgba(255,255,255,0.15); }
+
     /* === EMPTY STATE === */
     .empty-state {
       text-align: center;
@@ -580,6 +700,7 @@
   <button class="sort-btn" data-sort="fdv">FDV</button>
   <button class="sort-btn" data-sort="xMentions">X Mentions</button>
   <button class="sort-btn" data-sort="ratio">LP/FDV</button>
+  <button class="sort-btn" data-sort="holders">Holders</button>
   <input class="search-input" type="text" id="search-input" placeholder="Search symbol / contract..." />
 </div>
 
@@ -594,6 +715,8 @@
         <th data-col="fdv">FDV</th>
         <th data-col="ratio">LP / FDV</th>
         <th data-col="holders">HOLDERS</th>
+        <th data-col="top10Pct">TOP 10</th>
+        <th data-col="devPct">DEV</th>
         <th data-col="xMentions">X MENTIONS</th>
         <th data-col="mint">CONTRACT</th>
       </tr>
@@ -620,12 +743,14 @@
   // =========================================================
   // STATE
   // =========================================================
-  let tokens = {};         // mint -> token
+  let tokens = {};
   let sortKey = 'addedAt';
-  let sortDir = -1;         // -1 = desc, 1 = asc
+  let sortDir = -1;
   let searchQuery = '';
   let ws = null;
-  let webhookFired = new Set(); // mints that triggered webhook
+  let webhookFired = new Set();
+  // Track previous holders counts to detect changes
+  let prevHolders = {};
 
   // =========================================================
   // WEBSOCKET
@@ -634,9 +759,7 @@
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${protocol}//${location.host}`);
 
-    ws.onopen = () => {
-      setWsStatus('connected');
-    };
+    ws.onopen = () => { setWsStatus('connected'); };
 
     ws.onmessage = (e) => {
       try {
@@ -650,9 +773,7 @@
       setTimeout(connectWS, 3000);
     };
 
-    ws.onerror = () => {
-      setWsStatus('error');
-    };
+    ws.onerror = () => { setWsStatus('error'); };
   }
 
   function setWsStatus(status) {
@@ -677,8 +798,7 @@
     updateTimestamp();
     if (msg.type === 'init') {
       tokens = {};
-      msg.data.forEach(t => { tokens[t.mint] = t; });
-      // Load fired list on connect
+      msg.data.forEach(t => { tokens[t.mint] = t; prevHolders[t.mint] = t.holders; });
       fetch('/api/webhook/fired').then(r => r.json()).then(d => {
         (d.fired || []).forEach(m => webhookFired.add(m));
         renderAll();
@@ -690,14 +810,22 @@
       showToast(`🔔 Webhook: $${msg.data.symbol}`, 'amber');
     } else if (msg.type === 'token_added') {
       tokens[msg.data.mint] = msg.data;
+      prevHolders[msg.data.mint] = msg.data.holders;
       addRow(msg.data);
       showToast(`🟢 New: $${msg.data.symbol} listed`, 'green');
       renderAll();
     } else if (msg.type === 'token_updated') {
+      // Detect holders change before updating
+      const oldH = prevHolders[msg.data.mint];
+      const newH = msg.data.holders;
+      const holdersChanged = oldH !== undefined && oldH !== newH;
+      prevHolders[msg.data.mint] = newH;
+
       tokens[msg.data.mint] = msg.data;
-      updateRow(msg.data);
+      updateRow(msg.data, holdersChanged);
     } else if (msg.type === 'token_removed') {
       delete tokens[msg.data.mint];
+      delete prevHolders[msg.data.mint];
       removeRow(msg.data.mint);
       showToast(`🔴 Removed: ${msg.data.reason || ''}`, 'red');
     }
@@ -710,9 +838,7 @@
   function renderAll() {
     const tbody = document.getElementById('token-tbody');
     tbody.innerHTML = '';
-    getFiltered().forEach(t => {
-      tbody.appendChild(buildRow(t));
-    });
+    getFiltered().forEach(t => { tbody.appendChild(buildRow(t)); });
     toggleEmptyState();
     updateStats();
   }
@@ -750,6 +876,71 @@
     return tr;
   }
 
+  // =========================================================
+  // HOLDERS HELPER
+  // =========================================================
+  function holdersHTML(holders) {
+    const n = Number(holders) || 0;
+
+    // Tier thresholds
+    let tier, tierClass;
+    if (n === 0) {
+      tier = 'zero';
+      tierClass = 'holders-tier-zero';
+    } else if (n >= 500) {
+      tier = 'hot';
+      tierClass = 'holders-tier-hot';
+    } else if (n >= 100) {
+      tier = 'mid';
+      tierClass = 'holders-tier-mid';
+    } else {
+      tier = 'low';
+      tierClass = 'holders-tier-low';
+    }
+
+    // Mini progress bar fill: cap at 1000 holders = 100%
+    const barPct = n === 0 ? 0 : Math.min((n / 1000) * 100, 100).toFixed(1);
+
+    // Format number
+    const display = n === 0 ? '—' : fmtNum(n);
+
+    // Person icon color matches tier
+    return `
+      <div class="holders-cell ${tierClass}">
+        <svg width="13" height="13" viewBox="0 0 13 13" fill="currentColor" style="opacity:0.75;flex-shrink:0">
+          <circle cx="6.5" cy="3.5" r="2.5"/>
+          <path d="M1 12c0-3.038 2.462-5.5 5.5-5.5S12 8.962 12 12H1z"/>
+        </svg>
+        <span class="holders-val">${display}</span>
+        <div class="holders-bar-wrap">
+          <div class="holders-bar-fill" style="width:${barPct}%"></div>
+        </div>
+      </div>
+    `;
+  }
+
+
+  // =========================================================
+  // PCT CELL HELPER (Top10 / Dev)
+  // =========================================================
+  function pctHTML(pct, thresholds) {
+    if (pct === null || pct === undefined) {
+      return '<div class="pct-cell pct-none"><span class="pct-val">—</span></div>';
+    }
+    const val = Number(pct);
+    // thresholds: [safe_max, mid_max] — above mid_max = danger
+    const [safeMax, midMax] = thresholds;
+    let cls = val <= safeMax ? 'pct-safe' : val <= midMax ? 'pct-mid' : 'pct-danger';
+    const barPct = Math.min(val, 100).toFixed(1);
+    return `
+      <div class="pct-cell ${cls}">
+        <div class="pct-bar-wrap">
+          <div class="pct-bar-fill" style="width:${barPct}%"></div>
+        </div>
+        <span class="pct-val">${val.toFixed(1)}%</span>
+      </div>`;
+  }
+
   function rowHTML(t) {
     const age = getAge(t.addedAt);
     const ageClass = age.hours < 1 ? 'age-fresh' : age.hours < 6 ? 'age-mid' : 'age-old';
@@ -758,7 +949,6 @@
     const ratio = t.fdv > 0 ? (t.lp / t.fdv) : 0;
     const ratioFill = Math.min(ratio * 100, 100).toFixed(1);
     const ratioStr = (ratio * 100).toFixed(1) + '%';
-    const holders = fmtNum(t.holders);
     const lpClass = t.lp < 5000 ? 'warning' : '';
     const fdvClass = t.fdv < 30000 ? 'warning' : '';
     const mintShort = t.mint ? `${t.mint.slice(0,4)}…${t.mint.slice(-4)}` : '—';
@@ -805,7 +995,9 @@
           <span class="num">${ratioStr}</span>
         </div>
       </td>
-      <td><span class="num">${holders}</span></td>
+      <td id="holders-${t.mint}">${holdersHTML(t.holders)}</td>
+      <td>${pctHTML(t.top10Pct, [40, 70])}</td>
+      <td>${pctHTML(t.devPct,   [5, 15])}</td>
       <td>${xHtml}</td>
       <td>
         <a class="contract-link" href="${gmgnUrl}" target="_blank" title="${t.mint}">
@@ -819,12 +1011,22 @@
     // Re-render is called after in handleMessage
   }
 
-  function updateRow(t) {
+  function updateRow(t, holdersChanged) {
     const tr = document.getElementById(`row-${t.mint}`);
     if (!tr) { renderAll(); return; }
     tr.innerHTML = rowHTML(t);
     tr.classList.add('updated-flash');
     setTimeout(() => tr.classList.remove('updated-flash'), 800);
+
+    // Extra flash on the holders cell if it changed
+    if (holdersChanged) {
+      const hCell = document.getElementById(`holders-${t.mint}`);
+      if (hCell) {
+        hCell.classList.add('holders-updated');
+        setTimeout(() => hCell.classList.remove('holders-updated'), 1000);
+      }
+    }
+
     updateTimestamp();
   }
 
@@ -854,15 +1056,10 @@
     const ms = Date.now() - addedAt;
     const mins = Math.floor(ms / 60000);
     const hours = ms / 3600000;
-
     let text;
-    if (mins < 60) {
-      text = `${mins}m`;
-    } else if (hours < 24) {
-      text = `${hours.toFixed(1)}h`;
-    } else {
-      text = `${(hours/24).toFixed(1)}d`;
-    }
+    if (mins < 60) { text = `${mins}m`; }
+    else if (hours < 24) { text = `${hours.toFixed(1)}h`; }
+    else { text = `${(hours/24).toFixed(1)}d`; }
     return { text, hours, mins };
   }
 
@@ -890,8 +1087,7 @@
 
   function updateTimestamp() {
     const now = new Date();
-    const t = now.toTimeString().slice(0, 8);
-    document.getElementById('stat-time').textContent = t;
+    document.getElementById('stat-time').textContent = now.toTimeString().slice(0, 8);
   }
 
   function showToast(msg, type='green') {
@@ -922,19 +1118,12 @@
     renderAll();
   });
 
-  // Column header sort
   document.querySelectorAll('th[data-col]').forEach(th => {
     th.addEventListener('click', () => {
       const col = th.dataset.col;
-      document.querySelectorAll('th').forEach(t => {
-        t.classList.remove('sorted', 'asc');
-      });
-      if (sortKey === col) {
-        sortDir *= -1;
-      } else {
-        sortKey = col;
-        sortDir = -1;
-      }
+      document.querySelectorAll('th').forEach(t => { t.classList.remove('sorted', 'asc'); });
+      if (sortKey === col) { sortDir *= -1; }
+      else { sortKey = col; sortDir = -1; }
       th.classList.add('sorted');
       if (sortDir === 1) th.classList.add('asc');
       renderAll();
@@ -943,8 +1132,7 @@
 
   // Age live update
   setInterval(() => {
-    const rows = document.querySelectorAll('[id^="row-"]');
-    rows.forEach(tr => {
+    document.querySelectorAll('[id^="row-"]').forEach(tr => {
       const mint = tr.id.replace('row-', '');
       const t = tokens[mint];
       if (!t) return;
@@ -959,7 +1147,6 @@
   // =========================================================
   // INIT
   // =========================================================
-  // Show empty state initially
   document.getElementById('empty-state').style.display = 'block';
   connectWS();
 </script>
