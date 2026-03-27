@@ -35,21 +35,31 @@ class WebhookService {
     if (!this.enabled) return;
     if (this.firedSet.has(token.mint)) return;
     if ((token.fdv || 0) < this.minFdv) return;
+    if ((token.lp || 0) < (Number(process.env.WEBHOOK_MIN_LP) || 5000)) return;
+    if ((token.holders || 0) < (Number(process.env.WEBHOOK_MIN_HOLDERS) || 10)) return;
 
     this.firedSet.add(token.mint);
     await this._send(token);
   }
 
   async _send(token) {
+    const fmt1 = (v) => v !== null && v !== undefined ? Number(v).toFixed(1) + '%' : null;
+
     const payload = {
       network:   'solana',
       address:   token.mint,
       symbol:    token.symbol,
       xMentions: token.xMentions ?? null,
       holders:   token.holders   ?? 0,
+      top10Pct:  fmt1(token.top10Pct),
+      devPct:    fmt1(token.devPct),
     };
 
-    console.log(`[Webhook] 🚀 Firing $${token.symbol} | FDV=$${token.fdv} | X=${payload.xMentions} | Holders=${payload.holders}`);
+    console.log(
+      `[Webhook] 🚀 Firing $${token.symbol} | FDV=$${token.fdv}` +
+      ` | X=${payload.xMentions} | Holders=${payload.holders}` +
+      ` | Top10=${payload.top10Pct} | Dev=${payload.devPct}`
+    );
 
     try {
       const res = await axios.post(this.url, payload, {
